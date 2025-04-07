@@ -1,10 +1,11 @@
 /*============================================================================
   epub2txt v2 
   epub2txt.c
-  Copyright (c)2020 Kevin Boone, GPL v3.0
+  Copyright (c)2020-2024 Kevin Boone, GPL v3.0
 ============================================================================*/
 
 #define _GNU_SOURCE
+#define _XOPEN_SOURCE 500
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,8 @@
 #include "sxmlc.h"
 #include "xhtml.h"
 #include "util.h"
+
+static char *tempdir = NULL;
 
 /*============================================================================
   epub2txt_unescape_html
@@ -255,17 +258,26 @@ List *epub2txt_get_items (const char *opf, char **error)
       {
       XMLNode *root = XMLDoc_root (&doc);
 
-      int i, l = root->n_children;
-      for (i = 0; i < l; i++)
-	{
-	XMLNode *r1 = root->children[i];
-	// Add workaround for bug #4 
-	if (strcmp (r1->tag, "manifest") == 0 || strstr (r1->tag, ":manifest"))
+      int l;
+      if (root)
+        {
+	int i;
+        l = root->n_children;
+	for (i = 0; i < l; i++)
 	  {
-	  manifest = r1;
-	  got_manifest = TRUE;
+	  XMLNode *r1 = root->children[i];
+	  // Add workaround for bug #4 
+	  if (strcmp (r1->tag, "manifest") == 0 || strstr (r1->tag, ":manifest"))
+	    {
+	    manifest = r1;
+	    got_manifest = TRUE;
+	    }
 	  }
-	}
+        }
+      else
+        {
+        log_warning ("'%s' has no root eleemnt -- corrupt EPUB?", opf);
+        }
 
       if (!got_manifest)
 	{
@@ -276,7 +288,7 @@ List *epub2txt_get_items (const char *opf, char **error)
    
       ret = list_create_strings();
 
-      for (i = 0; i < l; i++)
+      for (int i = 0; i < l; i++)
 	{
 	XMLNode *r1 = root->children[i];
 	// Add workaround for bug #4
@@ -356,33 +368,40 @@ String *epub2txt_get_root_file (const char *opf, char **error)
     if (XMLDoc_parse_buffer_DOM (buff_cstr, APPNAME, &doc))
       {
       XMLNode *root = XMLDoc_root (&doc);
-      int i, l = root->n_children;
-      for (i = 0; i < l; i++)
-	{
-	XMLNode *r1 = root->children[i];
-	if (strcmp (r1->tag, "rootfiles") == 0)
+      if (root)
+        {
+        int i, l = root->n_children;
+	for (i = 0; i < l; i++)
 	  {
-	  XMLNode *rootfiles = r1;
-	  int i, l = rootfiles->n_children;
-	  for (i = 0; i < l; i++)
+	  XMLNode *r1 = root->children[i];
+	  if (strcmp (r1->tag, "rootfiles") == 0)
 	    {
-	    XMLNode *r1 = rootfiles->children[i];
-	    if (strcmp (r1->tag, "rootfile") == 0)
+	    XMLNode *rootfiles = r1;
+	    int i, l = rootfiles->n_children;
+	    for (i = 0; i < l; i++)
 	      {
-	      int k, nattrs = r1->n_attributes;
-	      for (k = 0; k < nattrs; k++)
+	      XMLNode *r1 = rootfiles->children[i];
+	      if (strcmp (r1->tag, "rootfile") == 0)
 		{
-		char *name = r1->attributes[k].name;
-		char *value = r1->attributes[k].value;
-		if (strcmp (name, "full-path") == 0)
+		int k, nattrs = r1->n_attributes;
+		for (k = 0; k < nattrs; k++)
 		  {
-		  ret = string_create (value);
+		  char *name = r1->attributes[k].name;
+		  char *value = r1->attributes[k].value;
+		  if (strcmp (name, "full-path") == 0)
+		    {
+		    ret = string_create (value);
+		    }
 		  }
 		}
 	      }
 	    }
 	  }
-	}
+        }
+      else
+        {
+        log_warning ("No root element in '%s' -- corrupt EPUB?", opf);
+        }
 
       if (ret == NULL)
         asprintf (error, "container.xml does not specify a root file");
@@ -399,7 +418,19 @@ String *epub2txt_get_root_file (const char *opf, char **error)
   return ret;
   }
 
-
+/*============================================================================
+  epub2txt_cleanup
+============================================================================*/
+void epub2txt_cleanup (void)
+  {
+  if (tempdir)
+    {
+    log_debug ("Deleting temporary directory");
+    run_command ((const char *[]){"rm", "-rf", tempdir, NULL}, FALSE);
+    free (tempdir);
+    tempdir = NULL;
+    }
+  }
 
 /*============================================================================
   epub2txt 
@@ -414,7 +445,7 @@ void epub2txt_do_file (const char *file, const Epub2TxtOptions *options,
     {
     log_debug ("File access OK");
 
-    char *tempbase, *tempdir;
+    char *tempbase;
 
     if (!(tempbase = getenv("TMP")) && !(tempbase = getenv("TMPDIR")))
       tempbase = "/tmp";
@@ -449,7 +480,7 @@ void epub2txt_do_file (const char *file, const Epub2TxtOptions *options,
       run_command((const char *[]){"chmod", "-R", "744", tempdir, NULL}, FALSE);
       log_debug ("Permissions fixed");
 
-      char *opf;
+      char *opf, *tmp;
       asprintf (&opf, "%s/META-INF/container.xml", tempdir);
       log_debug ("OPF path is: %s", opf);
       String *rootfile = epub2txt_get_root_file (opf, error);
@@ -458,7 +489,20 @@ void epub2txt_do_file (const char *file, const Epub2TxtOptions *options,
         log_debug ("OPF rootfile is: %s", string_cstr(rootfile));
 
         free (opf);
-        asprintf (&opf, "%s/%s", tempdir, string_cstr (rootfile));
+        asprintf (&tmp, "%s/%s", tempdir, string_cstr (rootfile));
+        opf = realpath (tmp, NULL);
+        free (tmp);
+
+        if (opf == NULL || !is_subpath (tempdir, opf))
+          {
+          if (opf == NULL)
+            asprintf (error, "Bad OPF rootfile path: %s", strerror (errno));
+          else
+            asprintf (error, "Bad OPF rootfile path \"%s\": outside EPUB "
+              "container", opf);
+          free (tempdir);
+          return;
+          }
 
         char *content_dir = strdup (opf);
         char *p = strrchr (content_dir, '/');
@@ -489,7 +533,24 @@ void epub2txt_do_file (const char *file, const Epub2TxtOptions *options,
 	      {
 	      const char *item = (const char *)list_get (list, i);
 	      free (opf);
-	      asprintf (&opf, "%s/%s", content_dir, item);
+	      asprintf (&tmp, "%s/%s", content_dir, item);
+	      opf = realpath (tmp, NULL);
+	      free (tmp);
+
+	      if (opf == NULL || !is_subpath (content_dir, opf))
+	        {
+	        if (opf == NULL)
+	          log_warning ("Skipping EPUB file \"%s\": invalid path (%s)",
+	            item, strerror (errno));
+	        else
+	          log_warning ("Skipping EPUB file \"%s\": outside EPUB content "
+	            "directory", item);
+	        continue;
+	        }
+
+	      if (options->section_separator)
+	        printf ("%s\n", options->section_separator);
+
 	      xhtml_file_to_stdout (opf, options, error);
 	      }
 	    list_destroy (list);
@@ -500,15 +561,13 @@ void epub2txt_do_file (const char *file, const Epub2TxtOptions *options,
         }
 
       if (rootfile) string_destroy (rootfile);
-      log_debug ("Deleting temporary directory");
-      run_command ((const char *[]){"rm", "-rf", tempdir, NULL}, FALSE);
       }
     else
       {
       // unzip failed
       }
 
-    free (tempdir);
+    epub2txt_cleanup();
     }
   else
     {
